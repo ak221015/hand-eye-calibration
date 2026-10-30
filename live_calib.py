@@ -144,30 +144,60 @@ class HandEyeCalibNode(Node):
             self.R_target2cam, self.t_target2cam,
             method=cv2.CALIB_HAND_EYE_PARK
         )
-        T = np.eye(4)
-        T[:3, :3] = R_est
-        T[:3, 3] = t_est.flatten()
+        
+        T_link6_cam = np.eye(4)
+        T_link6_cam[:3, :3] = R_est
+        T_link6_cam[:3, 3] = t_est.flatten()
 
-        quat = R.from_matrix(R_est).as_quat()
-        euler = R.from_matrix(R_est).as_euler("xyz", degrees=True)
+        # Target position consistency check in robot base frame
+        target_pos = []
+        for Rg, tg, Rt, tt in zip(self.R_gripper2base, self.t_gripper2base, self.R_target2cam, self.t_target2cam):
+            Tg = np.eye(4)
+            Tg[:3, :3], Tg[:3, 3] = Rg, tg.flatten()
+            Tt = np.eye(4)
+            Tt[:3, :3], Tt[:3, 3] = Rt, tt.flatten()
+            # Base -> Gripper -> Camera -> Board
+            target_pos.append((Tg @ T_link6_cam @ Tt)[:3, 3])
 
-        print("\n================ CALIBRATION RESULT ================")
-        print(f"Transformation Matrix 4x4 (arm_6_link -> camera_color_optical_frame):\n{np.round(T, 6)}")
-        print(f"Translation [x, y, z] (m):   {np.round(t_est.flatten(), 6)}")
-        print(f"Quaternion [qx, qy, qz, qw]: {np.round(quat, 6)}")
-        print(f"Euler XYZ (deg):             {np.round(euler, 4)}")
-        print("====================================================\n")
+        pos_err_mm = np.linalg.norm(np.array(target_pos) - np.mean(target_pos, axis=0), axis=1) * 1000.0
+        rmse_mm = np.sqrt(np.mean(pos_err_mm**2))
+        max_err_mm = np.max(pos_err_mm)
+
+        # Transform from arm_tool0 (arm_6_link) to gripper_tcp (+0.167m along Z, +90 deg around Z)
+        T_tool0_tcp = np.eye(4)
+        T_tool0_tcp[:3, :3] = R.from_euler("z", 90, degrees=True).as_matrix()
+        T_tool0_tcp[:3, 3] = [0.0, 0.0, 0.167]
+
+        # Target calibration matrix: gripper_tcp -> camera_color_optical_frame
+        T_tcp_cam = np.linalg.inv(T_tool0_tcp) @ T_link6_cam
+
+        R_tcp = T_tcp_cam[:3, :3]
+        t_tcp = T_tcp_cam[:3, 3]
+        quat_tcp = R.from_matrix(R_tcp).as_quat()
+        euler_tcp = R.from_matrix(R_tcp).as_euler("xyz", degrees=True)
+
+        print("\n================ CALIBRATION RESULT (gripper_tcp -> camera) ================")
+        print(np.array2string(T_tcp_cam, precision=6, suppress_small=True))
+        print(f"Translation [x, y, z] (m):   {np.round(t_tcp, 6)}")
+        print(f"Quaternion [qx, qy, qz, qw]: {np.round(quat_tcp, 6)}")
+        print(f"Euler XYZ (deg):             {np.round(euler_tcp, 4)}")
+        print(f"Calibration accuracy (RMSE): {rmse_mm:.2f} mm (Max error: {max_err_mm:.2f} mm)")
+        print("============================================================================\n")
 
         with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
             json.dump({
                 "calibration_mode": CALIB_MODE,
+                "parent_frame": "gripper_tcp",
+                "child_frame": "camera_color_optical_frame",
                 "used_poses": len(self.R_target2cam),
-                "transformation_matrix_4x4": T.tolist(),
-                "translation_xyz_m": t_est.flatten().tolist(),
-                "quaternion_xyzw": quat.tolist(),
-                "euler_xyz_deg": euler.tolist(),
+                "rmse_error_mm": round(float(rmse_mm), 3),
+                "max_error_mm": round(float(max_err_mm), 3),
+                "transformation_matrix_4x4": T_tcp_cam.tolist(),
+                "translation_xyz_m": t_tcp.tolist(),
+                "quaternion_xyzw": quat_tcp.tolist(),
+                "euler_xyz_deg": euler_tcp.tolist(),
             }, f, indent=4)
-        self.get_logger().info(f"Saved result to {OUTPUT_JSON}")
+        self.get_logger().info(f"Saved calibration result to {OUTPUT_JSON}")
 
 
 def main():
