@@ -1,7 +1,4 @@
-import argparse
-import json
-import os
-import sys
+import argparse, json, sys
 import cv2
 import numpy as np
 
@@ -9,7 +6,6 @@ import numpy as np
 IMAGE_TOPIC = "/camera/camera/color/image_raw"
 OUTPUT_INTRINSICS_JSON = "camera_intrinsics.json"
 
-# ChArUco board: 7x5 squares, 30mm square, 20mm marker
 board = cv2.aruco.CharucoBoard(
     (7, 5), 0.030, 0.020, cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_6X6_250)
 )
@@ -35,8 +31,7 @@ def run_intrinsic_calibration(all_obj_pts, all_img_pts, image_size):
     """Calibrate camera intrinsics (K, D) with outlier rejection."""
     if len(all_obj_pts) < MIN_SAMPLES_FOR_CALIB:
         raise RuntimeError(
-            f"[ERROR] Collected only {len(all_obj_pts)} frames. "
-            f"At least {MIN_SAMPLES_FOR_CALIB} diverse views are required."
+            f"[ERROR] Collected only {len(all_obj_pts)} frames (need >= {MIN_SAMPLES_FOR_CALIB})."
         )
 
     print(f"Running initial camera calibration on {len(all_obj_pts)} frames...")
@@ -44,43 +39,36 @@ def run_intrinsic_calibration(all_obj_pts, all_img_pts, image_size):
         all_obj_pts, all_img_pts, image_size, None, None
     )
 
-    # Compute per-frame reprojection error for Outlier Rejection
-    frame_errors = []
-    for i in range(len(all_obj_pts)):
-        proj_pts, _ = cv2.projectPoints(
-            all_obj_pts[i], rvecs[i], tvecs[i], K_init, D_init
-        )
-        err = np.sqrt(
-            np.mean(
-                np.sum(
-                    (all_img_pts[i].reshape(-1, 2) - proj_pts.reshape(-1, 2)) ** 2,
-                    axis=1,
-                )
+    frame_errors = np.array(
+        [
+            cv2.norm(
+                all_img_pts[i],
+                cv2.projectPoints(all_obj_pts[i], rvecs[i], tvecs[i], K_init, D_init)[
+                    0
+                ],
+                cv2.NORM_L2,
             )
-        )
-        frame_errors.append(err)
-
-    frame_errors = np.array(frame_errors)
+            / np.sqrt(len(all_img_pts[i]))
+            for i in range(len(all_obj_pts))
+        ]
+    )
     threshold = max(MAX_FRAME_REPROJ_PX, float(np.median(frame_errors) * 2.0))
-    inliers = [i for i, e in enumerate(frame_errors) if e <= threshold]
-
-    num_total = len(all_obj_pts)
-    num_outliers = num_total - len(inliers)
+    mask = frame_errors <= threshold
+    num_total, num_outliers = len(all_obj_pts), int(np.sum(~mask))
     outlier_ratio = num_outliers / num_total
 
-    if outlier_ratio > MAX_OUTLIER_RATIO or len(inliers) < MIN_SAMPLES_FOR_CALIB:
+    if outlier_ratio > MAX_OUTLIER_RATIO or np.sum(mask) < MIN_SAMPLES_FOR_CALIB:
         raise RuntimeError(
             f"[ERROR] Camera calibration outlier rejection failed: {num_outliers}/{num_total} frames "
-            f"({outlier_ratio * 100:.1f}%) exceeded {threshold:.2f} px reprojection error. "
-            "Check board dimensions or motion blur."
+            f"({outlier_ratio * 100:.1f}%) exceeded {threshold:.2f} px reprojection error."
         )
 
     if num_outliers > 0:
         print(
             f"Filtered out {num_outliers}/{num_total} outlier frames (threshold: {threshold:.2f} px)"
         )
-        all_obj_pts = [all_obj_pts[i] for i in inliers]
-        all_img_pts = [all_img_pts[i] for i in inliers]
+        all_obj_pts = [o for o, m in zip(all_obj_pts, mask) if m]
+        all_img_pts = [p for p, m in zip(all_img_pts, mask) if m]
         rms_final, K_final, D_final, _, _ = cv2.calibrateCamera(
             all_obj_pts, all_img_pts, image_size, None, None
         )
@@ -122,18 +110,20 @@ def calibrate_from_bag(bag_path):
     from rosbags.typesys import Stores, get_typestore
 
     typestore = get_typestore(Stores.ROS2_HUMBLE)
-    all_obj_pts, all_img_pts = [], []
-    image_size = None
-    last_centroid = None
-    last_area = None
+    all_obj_pts, all_img_pts, image_size, last_centroid, last_area = (
+        [],
+        [],
+        None,
+        None,
+        None,
+    )
 
     with Reader(bag_path) as reader:
-        img_conns = [c for c in reader.connections if c.topic == IMAGE_TOPIC]
-        for conn, _, raw in reader.messages(img_conns):
+        for conn, _, raw in reader.messages(
+            [c for c in reader.connections if c.topic == IMAGE_TOPIC]
+        ):
             msg = typestore.deserialize_cdr(raw, conn.msgtype)
-            if image_size is None:
-                image_size = (int(msg.width), int(msg.height))
-
+            image_size = image_size or (int(msg.width), int(msg.height))
             img = np.frombuffer(msg.data, dtype=np.uint8).reshape(
                 (msg.height, msg.width, 3)
             )
@@ -151,22 +141,20 @@ def calibrate_from_bag(bag_path):
                 continue
 
             pts_2d = corners.reshape(-1, 2)
-            centroid = np.mean(pts_2d, axis=0)
-            span = np.ptp(pts_2d, axis=0)
+            centroid, span = np.mean(pts_2d, axis=0), np.ptp(pts_2d, axis=0)
             area = float(span[0] * span[1])
 
-            # Ensure diverse board positions and scales across the image sensor
             if last_centroid is not None:
-                shift = np.linalg.norm(centroid - last_centroid)
-                area_change = abs(area - last_area) / max(last_area, 1.0)
-                if shift < MIN_CENTROID_SHIFT_PX and area_change < 0.12:
+                if (
+                    np.linalg.norm(centroid - last_centroid) < MIN_CENTROID_SHIFT_PX
+                    and abs(area - last_area) / max(last_area, 1.0) < 0.12
+                ):
                     continue
 
             obj_pts, img_pts = board.matchImagePoints(corners, ids)
             all_obj_pts.append(obj_pts.astype(np.float32))
             all_img_pts.append(img_pts.astype(np.float32))
-            last_centroid = centroid
-            last_area = area
+            last_centroid, last_area = centroid, area
 
     print(f"Extracted {len(all_obj_pts)} diverse board views from bag: {bag_path}")
     run_intrinsic_calibration(all_obj_pts, all_img_pts, image_size)
@@ -181,13 +169,11 @@ def calibrate_live():
     class LiveIntrinsicCalibNode(Node):
         def __init__(self):
             super().__init__("camera_intrinsic_calib_node")
-            self.all_obj_pts = []
-            self.all_img_pts = []
-            self.image_size = None
-            self.coverage_mask = None
+            self.all_obj_pts, self.all_img_pts = [], []
+            self.image_size, self.coverage_mask = None, None
             self.create_subscription(Image, IMAGE_TOPIC, self.image_cb, 10)
             self.get_logger().info(
-                "Live Camera Calibration started. [SPACE/S] = capture view, [C] = calibrate, [Q] = quit"
+                "Live Camera Calibration started. [SPACE/S] = capture, [C] = calibrate, [Q] = quit"
             )
 
         def image_cb(self, msg: Image):
@@ -204,9 +190,9 @@ def calibrate_live():
                 img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
             vis = cv2.addWeighted(img, 0.85, self.coverage_mask, 0.4, 0)
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            corners, ids, _, _ = detector.detectBoard(gray)
-
+            corners, ids, _, _ = detector.detectBoard(
+                cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            )
             n_corners = len(ids) if ids is not None else 0
             valid = (
                 ids is not None
@@ -216,7 +202,6 @@ def calibrate_live():
 
             if valid:
                 cv2.aruco.drawDetectedCornersCharuco(vis, corners, ids, (0, 255, 0))
-
             cv2.putText(
                 vis,
                 f"Views: {len(self.all_obj_pts)}/{MIN_SAMPLES_FOR_CALIB}+ | Corners: {n_corners}/24",
@@ -249,7 +234,6 @@ def calibrate_live():
                 self.get_logger().info(
                     f"Captured view #{len(self.all_obj_pts)} ({n_corners} corners)"
                 )
-
             elif key == ord("c"):
                 try:
                     run_intrinsic_calibration(
@@ -257,14 +241,12 @@ def calibrate_live():
                     )
                 except RuntimeError as err:
                     self.get_logger().error(str(err))
-
             elif key == ord("q"):
                 cv2.destroyAllWindows()
                 rclpy.shutdown()
 
     rclpy.init()
-    node = LiveIntrinsicCalibNode()
-    rclpy.spin(node)
+    rclpy.spin(LiveIntrinsicCalibNode())
 
 
 if __name__ == "__main__":
@@ -275,12 +257,8 @@ if __name__ == "__main__":
         "--bag", type=str, default=None, help="Path to ROS 2 bag directory (optional)"
     )
     args = parser.parse_args()
-
     try:
-        if args.bag:
-            calibrate_from_bag(args.bag)
-        else:
-            calibrate_live()
+        calibrate_from_bag(args.bag) if args.bag else calibrate_live()
     except RuntimeError as e:
         print(e, file=sys.stderr)
         sys.exit(1)
